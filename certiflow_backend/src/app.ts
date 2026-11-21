@@ -1,7 +1,9 @@
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
-import path from "path";
+import swaggerUi from "swagger-ui-express";
+import { openapi } from "./docs/openapi";
+import { corsOrigins } from "./config/env";
 import authRouter from "./modules/auth/auth.router";
 import batchRouter from "./modules/batches/batch.router";
 import certificateRouter from "./modules/certificates/certificate.router";
@@ -10,12 +12,10 @@ import verificationRouter from "./modules/verification/verification.router";
 const app = express();
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
-app.use(cors());
+app.use(cors({ origin: corsOrigins() }));
 app.use(express.json());
 
-// Serve generated certificates
-const certificatesPath = path.resolve(process.cwd(), "uploads/certificates");
-app.use("/certificates", express.static(certificatesPath));
+// Certificate PDFs are NOT served statically: see GET /api/certificates/:id/download (signed link).
 
 // Healthcheck
 app.get("/", (_req, res) => {
@@ -30,6 +30,10 @@ app.get("/", (_req, res) => {
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
+
+// API docs: Swagger UI plus the raw spec (importable into Postman)
+app.get("/api/docs.json", (_req, res) => res.json(openapi));
+app.use("/api/docs", swaggerUi.serve, swaggerUi.setup(openapi, { customSiteTitle: "CertiFlow API" }));
 
 // Mount module routers
 app.use("/api/auth", authRouter);

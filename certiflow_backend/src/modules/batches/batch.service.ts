@@ -2,8 +2,9 @@ import * as XLSX from "xlsx";
 import prisma from "../../config/db";
 import { CandidateRowSchema, OfficerReviewInput } from "./batch.schema";
 import { AuthenticatedUser } from "../../middlewares/auth.middleware";
-import { BatchStatus, Role, ApprovalDecision } from "@prisma/client";
+import { BatchStatus, Role, ApprovalDecision, Prisma } from "@prisma/client";
 import crypto from "crypto";
+import { slaDeadlineFromNow } from "../../config/env";
 
 export interface SpreadsheetValidationError {
   row: number;
@@ -52,39 +53,47 @@ export class BatchService {
     return batch;
   }
 
-  static async getBatches(user: AuthenticatedUser) {
+  /**
+   * Lean list (no candidate rows, no PII). `inbox` = batches waiting for THIS user's action:
+   * centre -> sent back, district -> pending and not yet voted this cycle, quality/state -> their step.
+   */
+  static async getBatches(user: AuthenticatedUser, opts: { inbox?: boolean; status?: BatchStatus } = {}) {
+    const where: Prisma.BatchWhereInput = {};
     if (user.role === Role.CENTRE) {
       const centre = await prisma.trainingCentre.findFirst({ where: { userId: user.id } });
       if (!centre) return [];
-      return prisma.batch.findMany({
-        where: { centreId: centre.id },
-        include: { centre: true, candidates: true, approvals: { include: { officer: true } } },
-        orderBy: { createdAt: "desc" },
-      });
+      where.centreId = centre.id;
+    } else if (user.role === Role.DISTRICT_OFFICER) {
+      where.centre = { districtId: user.districtId ?? "none" };
+    }
+    if (opts.status) where.status = opts.status;
+    if (opts.inbox) {
+      const step: Record<string, BatchStatus> = {
+        CENTRE: BatchStatus.SENT_BACK,
+        DISTRICT_OFFICER: BatchStatus.DISTRICT_PENDING,
+        QUALITY_TEAM: BatchStatus.QUALITY_PENDING,
+        STATE_OFFICE: BatchStatus.STATE_PENDING,
+      };
+      where.status = step[user.role];
     }
 
-    if (user.role === Role.DISTRICT_OFFICER) {
-      return prisma.batch.findMany({
-        where: {
-          centre: { districtId: user.districtId! },
+    const batches = await prisma.batch.findMany({
+      where,
+      include: {
+        centre: { include: { district: true } },
+        approvals: {
+          select: { officerId: true, reviewCycle: true, role: true, decision: true, createdAt: true },
+          orderBy: { createdAt: "asc" },
         },
-        include: { centre: { include: { district: true } }, candidates: true, approvals: { include: { officer: true } } },
-        orderBy: { createdAt: "desc" },
-      });
-    }
-
-    if (user.role === Role.QUALITY_TEAM) {
-      return prisma.batch.findMany({
-        include: { centre: { include: { district: true } }, candidates: true, approvals: { include: { officer: true } } },
-        orderBy: { createdAt: "desc" },
-      });
-    }
-
-    // STATE_OFFICE
-    return prisma.batch.findMany({
-      include: { centre: { include: { district: true } }, candidates: true, approvals: { include: { officer: true } } },
+      },
       orderBy: { createdAt: "desc" },
+      take: 200,
     });
+
+    if (opts.inbox && user.role === Role.DISTRICT_OFFICER) {
+      return batches.filter((b) => !b.approvals.some((a) => a.officerId === user.id && a.reviewCycle === b.reviewCycle));
+    }
+    return batches;
   }
 
   static async getBatchById(batchId: string, user: AuthenticatedUser) {
@@ -93,8 +102,17 @@ export class BatchService {
       include: {
         centre: { include: { district: true } },
         candidates: true,
-        approvals: { include: { officer: true }, orderBy: { createdAt: "asc" } },
-        certificates: true,
+        approvals: {
+          include: { officer: { select: { id: true, name: true, role: true } } },
+          orderBy: { createdAt: "asc" },
+        },
+        certificates: {
+          select: {
+            id: true, certificateNumber: true, candidateId: true, status: true, issuedAt: true,
+            revokedAt: true, revocationReason: true,
+            deliveryJobs: { select: { status: true, attempts: true, lastError: true, deliveredAt: true } },
+          },
+        },
         auditLogs: { orderBy: { timestamp: "desc" } },
       },
     });
@@ -279,8 +297,7 @@ export class BatchService {
       throw new Error("Cannot submit an empty batch. Upload candidates first.");
     }
 
-    // SLA: 48 hours for district review
-    const slaDeadline = new Date(Date.now() + 48 * 60 * 60 * 1000);
+        const slaDeadline = slaDeadlineFromNow();
 
     const updated = await prisma.batch.update({
       where: { id: batchId },
@@ -318,12 +335,7 @@ export class BatchService {
     return prisma.$transaction(async (tx) => {
       const batch = await tx.batch.findUnique({
         where: { id: batchId },
-        include: {
-          centre: true,
-          approvals: {
-            where: { reviewCycle: { equals: undefined } }, // placeholder
-          },
-        },
+        include: { centre: true },
       });
 
       if (!batch) throw new Error("Batch not found");
@@ -429,11 +441,14 @@ export class BatchService {
         }
       }
 
+      const advanced = newStatus !== batch.status;
       const updated = await tx.batch.update({
         where: { id: batchId, version: batch.version },
         data: {
           status: newStatus,
           version: { increment: 1 },
+          // Each approval step gets its own SLA clock and can be escalated once.
+          ...(advanced ? { slaDeadline: slaDeadlineFromNow(), escalatedAt: null } : {}),
         },
       });
 
@@ -498,6 +513,7 @@ export class BatchService {
         data: {
           status: nextStatus,
           version: { increment: 1 },
+          ...(nextStatus === BatchStatus.STATE_PENDING ? { slaDeadline: slaDeadlineFromNow(), escalatedAt: null } : {}),
         },
       });
 
@@ -601,7 +617,7 @@ export class BatchService {
       }
 
       const newCycle = batch.reviewCycle + 1;
-      const slaDeadline = new Date(Date.now() + 48 * 60 * 60 * 1000);
+      const slaDeadline = slaDeadlineFromNow();
 
       const updated = await tx.batch.update({
         where: { id: batchId },
@@ -609,6 +625,7 @@ export class BatchService {
           status: BatchStatus.DISTRICT_PENDING,
           reviewCycle: newCycle,
           slaDeadline,
+          escalatedAt: null,
           version: { increment: 1 },
         },
       });

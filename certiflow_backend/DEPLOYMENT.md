@@ -9,7 +9,7 @@
 | **Peak Throughput (Results Day)** | 500 batches approved / hour | Ingestion burst: 30,000 candidates requiring certificates within 60 mins |
 | **Peak PDF Rendering** | 30,000 PDFs / hour (8.33 PDFs/sec sustained) | Dedicated background compute pool isolating PDF generation from API pods |
 | **Peak WhatsApp Delivery** | 30,000 messages / hour | Asynchronous job queues with rate-limiting, exponential backoff & dead-letter queue (DLQ) |
-| **Public Verification Traffic** | Thousands of lookups / day in high-volume bursts | Edge caching (Cloudflare) + distributed in-memory cache (Redis Cluster) |
+| **Public Verification Traffic** | Thousands of lookups / day in high-volume bursts | Indexed PostgreSQL lookup (answers are never cached, so a cancelled certificate is reported at once) + Cloudflare WAF and Redis-backed rate limiting for bursts |
 
 ---
 
@@ -26,7 +26,7 @@ flowchart TD
 
     subgraph Edge["Edge Layer (Cloudflare)"]
         CF_CDN["Cloudflare CDN & WAF"]
-        CF_CACHE["Edge Cache (/api/verify/*)"]
+        CF_CACHE["WAF / rate limit (/api/verify/*, no caching)"]
     end
 
     subgraph Ingress["Ingress & API Gateway"]
@@ -66,7 +66,7 @@ flowchart TD
     TC --> ALB
     DO --> ALB
     PUB --> CF_CDN --> CF_CACHE
-    CF_CACHE -- "Cache Miss" --> ALB
+    CF_CACHE --> ALB
     ALB --> API1 & API2 & APIn
 
     API1 & API2 & APIn --> PG_PRIMARY
@@ -135,7 +135,8 @@ flowchart TD
 
 ### Scenario B: Redis Restart / Cache Eviction
 * **Behavior**: Redis is configured in Cluster Mode with Multi-AZ replica and automatic failover.
-* **Fallback Strategy**: If Redis is temporarily unreachable, the application automatically switches to in-memory caching fallback (`InMemoryCache` in `src/config/redis.ts`), directly querying PostgreSQL read replicas without crashing user requests.
+* **What Redis holds**: only the verification rate-limit counters (and, when added, the Socket.io adapter). No correctness data lives in Redis.
+* **Fallback Strategy**: The client reconnects with backoff (`src/config/redis.ts`); while Redis is down the rate limiter fails open, so public verification stays available. Verification answers come from PostgreSQL, so a Redis outage cannot show a cancelled certificate as valid.
 
 ### Scenario C: WhatsApp Provider Outage / Flakiness
 * **Simulated & Proven**: Validated in our test suite against a 35% failure rate.
@@ -155,7 +156,7 @@ flowchart TD
 * **Object Encryption**: Server-Side Encryption with AWS KMS (`SSE-KMS`).
 * **Access Control**:
   * Public users viewing `/api/verify/:id` receive metadata only (with masked candidate names).
-  * Authorized downloads (candidate via WhatsApp or centre) receive a **Presigned URL** expiring in 15 minutes:
+  * Candidates receive a signed, expiring link on WhatsApp (`/api/certificates/:id/download?token=...`, HMAC-signed, 7 days). In the current code the API checks the signature and cancellation status, then streams the file. In production the same check would return an S3 **Presigned URL** expiring in 15 minutes:
     ```typescript
     const presignedUrl = await s3.getSignedUrlPromise('getObject', {
       Bucket: 'certiflow-certificates-prod',
@@ -177,9 +178,9 @@ flowchart TD
   * SQS Queue Latency & Queue Depth.
   * PDF Generation throughput (PDFs/sec) and p95 latency.
   * Outbound WhatsApp delivery success rate ($> 99.5\%$ SLA).
-  * Cache Hit Ratio on `/api/verify/*` ($> 92\%$ target).
+  * `/api/verify/*` request rate, 429 rate and p95 latency.
 * **SLA Breach Alarms**:
-  * Automated worker flags any batch waiting $> 48$ hours for district review, alerting State Office.
+  * The worker escalates any approval step waiting longer than `SLA_HOURS` (48) once, with an audit entry and a realtime event to the State Office.
 
 ---
 
@@ -203,5 +204,5 @@ flowchart TD
    * *Decision*: Used containerized Fargate workers over AWS Lambda for PDF rendering because `pdfkit` and fonts bundle more reliably inside Docker with no 15-minute Lambda timeouts or cold-start penalties during 30,000-candidate bursts.
 2. **RabbitMQ / SQS vs. Kafka**:
    * *Decision*: SQS/RabbitMQ chosen over Kafka because message ordering is per-batch rather than globally ordered stream, saving hundreds of dollars/month in idle broker costs.
-3. **Redis Caching vs. Direct Database Queries**:
-   * *Decision*: Caching public certificate lookups with 1-hour TTL reduces database read IOPS by over 90% during results release bursts, protecting PostgreSQL from denial-of-service.
+3. **No verification cache**:
+   * *Decision*: Public lookups hit an indexed PostgreSQL row on every request. At thousands of lookups a day (bursts of a few per second) this is cheap, and it removes any chance of a stale cache or CDN showing a cancelled certificate as valid. Redis is used for rate limiting instead. If load ever demands a cache, use a short TTL plus explicit invalidation on revoke.

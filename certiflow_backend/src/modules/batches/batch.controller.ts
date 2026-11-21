@@ -3,6 +3,19 @@ import { BatchService } from "./batch.service";
 import { CreateBatchSchema, OfficerReviewSchema } from "./batch.schema";
 import { AuthRequest } from "../../middlewares/auth.middleware";
 import { SlaMonitorWorker } from "../../workers/sla.worker";
+import { Prisma, BatchStatus } from "@prisma/client";
+import { emitBatchEvent } from "../../realtime/events";
+import { publish } from "../../queues/broker";
+import { Q } from "../../queues/queue-names";
+
+// Races on a batch surface as Prisma conflicts: tell the client to retry instead of leaking internals.
+function reviewError(res: Response, err: any): void {
+  if (err instanceof Prisma.PrismaClientKnownRequestError && ["P2025", "P2002", "P2034"].includes(err.code)) {
+    res.status(409).json({ error: "Another decision was recorded at the same time. Refresh and retry." });
+    return;
+  }
+  res.status(String(err?.message).includes("Forbidden") ? 403 : 400).json({ error: err?.message ?? "Request failed" });
+}
 
 export class BatchController {
   static async create(req: AuthRequest, res: Response): Promise<void> {
@@ -21,7 +34,15 @@ export class BatchController {
 
   static async list(req: AuthRequest, res: Response): Promise<void> {
     try {
-      const batches = await BatchService.getBatches(req.user!);
+      const status = String(req.query.status ?? "");
+      if (status && !(status in BatchStatus)) {
+        res.status(400).json({ error: `Unknown status. Valid: ${Object.keys(BatchStatus).join(", ")}` });
+        return;
+      }
+      const batches = await BatchService.getBatches(req.user!, {
+        inbox: req.query.inbox === "true",
+        status: status ? (status as BatchStatus) : undefined,
+      });
       res.json(batches);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -64,6 +85,7 @@ export class BatchController {
     try {
       const id = String(req.params.id);
       const batch = await BatchService.submitBatch(id, req.user!.id);
+      void emitBatchEvent(id, "batch.updated");
       res.json(batch);
     } catch (err: any) {
       res.status(400).json({ error: err.message });
@@ -79,10 +101,10 @@ export class BatchController {
         return;
       }
       const updated = await BatchService.reviewDistrictBatch(id, req.user!, parsed.data);
+      void emitBatchEvent(id, "batch.updated");
       res.json(updated);
     } catch (err: any) {
-      const status = err.message.includes("Forbidden") ? 403 : 400;
-      res.status(status).json({ error: err.message });
+      reviewError(res, err);
     }
   }
 
@@ -95,10 +117,10 @@ export class BatchController {
         return;
       }
       const updated = await BatchService.reviewQualityBatch(id, req.user!, parsed.data);
+      void emitBatchEvent(id, "batch.updated");
       res.json(updated);
     } catch (err: any) {
-      const status = err.message.includes("Forbidden") ? 403 : 400;
-      res.status(status).json({ error: err.message });
+      reviewError(res, err);
     }
   }
 
@@ -111,10 +133,14 @@ export class BatchController {
         return;
       }
       const updated = await BatchService.reviewStateBatch(id, req.user!, parsed.data);
+      void emitBatchEvent(id, "batch.updated");
+      if (updated.status === "APPROVED") {
+        // Hand off to the worker. If the broker is down the worker's sweeper picks the batch up later.
+        publish(Q.issue, { batchId: id }).catch((e) => console.error(`[queue] enqueue failed for ${id}: ${e.message}`));
+      }
       res.json(updated);
     } catch (err: any) {
-      const status = err.message.includes("Forbidden") ? 403 : 400;
-      res.status(status).json({ error: err.message });
+      reviewError(res, err);
     }
   }
 
@@ -122,6 +148,7 @@ export class BatchController {
     try {
       const id = String(req.params.id);
       const batch = await BatchService.resubmitBatch(id, req.user!.id);
+      void emitBatchEvent(id, "batch.updated");
       res.json(batch);
     } catch (err: any) {
       res.status(400).json({ error: err.message });
@@ -130,7 +157,7 @@ export class BatchController {
 
   static async getStuckBatches(_req: AuthRequest, res: Response): Promise<void> {
     try {
-      const breaches = await SlaMonitorWorker.scanAndEscalateBreaches();
+      const breaches = await SlaMonitorWorker.listBreached();
       res.json(breaches);
     } catch (err: any) {
       res.status(500).json({ error: err.message });

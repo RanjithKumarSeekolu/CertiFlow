@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 
-const JWT_SECRET = process.env.JWT_SECRET || "certiflow_super_secret_jwt_key_2026";
+import { jwtSecret } from "../config/env";
 
 export interface AuthenticatedUser {
   id: string;
@@ -29,7 +29,7 @@ export function authenticate(req: AuthRequest, res: Response, next: NextFunction
   }
 
   try {
-    const payload = jwt.verify(token, JWT_SECRET) as unknown as AuthenticatedUser;
+    const payload = jwt.verify(token, jwtSecret()) as unknown as AuthenticatedUser;
     req.user = payload;
     next();
   } catch (err) {

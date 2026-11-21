@@ -3,7 +3,7 @@ import bcrypt from "bcryptjs";
 import prisma from "../../config/db";
 import { LoginInput } from "./auth.schema";
 
-const JWT_SECRET = process.env.JWT_SECRET || "certiflow_super_secret_jwt_key_2026";
+import { jwtSecret } from "../../config/env";
 
 export class AuthService {
   static generateToken(user: { id: string; email: string; role: string; districtId: string | null; name: string }) {
@@ -15,7 +15,7 @@ export class AuthService {
         districtId: user.districtId,
         name: user.name,
       },
-      JWT_SECRET,
+      jwtSecret(),
       { expiresIn: "7d" }
     );
   }

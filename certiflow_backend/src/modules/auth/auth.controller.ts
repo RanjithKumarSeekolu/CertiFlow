@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { AuthService } from "./auth.service";
 import { LoginSchema, DemoLoginSchema } from "./auth.schema";
+import { demoModeEnabled } from "../../config/env";
 
 export class AuthController {
   static async login(req: Request, res: Response): Promise<void> {
@@ -18,6 +19,10 @@ export class AuthController {
   }
 
   static async demoLogin(req: Request, res: Response): Promise<void> {
+    if (!demoModeEnabled()) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
     try {
       const parsed = DemoLoginSchema.safeParse(req.body);
       if (!parsed.success) {

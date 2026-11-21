@@ -96,6 +96,7 @@ model Batch {
   totalCandidates Int             @default(0)
   status          BatchStatus     @default(DRAFT)
   slaDeadline     DateTime?
+  escalatedAt     DateTime?
   submittedAt     DateTime?
   approvedAt      DateTime?
   version         Int             @default(1)

@@ -1,266 +1,275 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import * as XLSX from "xlsx";
-import { CandidateRowSchema } from "../src/modules/batches/batch.schema";
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
+import {
+  app, prisma, request, as, review, sheet, goodRows, wipeBatches,
+  submittedBatch, approvedBatch, loadTokens, waitFor, waitDelivered,
+} from "./helpers";
+import { startWorkers } from "../src/workers/runner";
+import { purgeAll, closePublisher, deadLetterCount } from "../src/queues/broker";
+import { Q } from "../src/queues/queue-names";
+import { SlaMonitorWorker } from "../src/workers/sla.worker";
 import { StandinWhatsAppProvider } from "../src/integrations/whatsapp-provider";
-import { generateCertificateNumber, generateVerificationHash } from "../src/utils/crypto";
-import { CertificateService } from "../src/modules/certificates/certificate.service";
+import { signDownloadToken } from "../src/utils/crypto";
 
-describe("CertiFlow Core Engine: The 6 Mandatory Moments", () => {
-  beforeEach(() => {
-    StandinWhatsAppProvider.reset();
-  });
+let workers: { stop(): Promise<void> };
+beforeAll(async () => {
+  await loadTokens();
+  workers = await startWorkers();
+});
+beforeEach(async () => {
+  await purgeAll(); // drop messages left over from the previous test
+  await wipeBatches();
+  StandinWhatsAppProvider.reset();
+  StandinWhatsAppProvider.failureRate = 0.35;
+  StandinWhatsAppProvider.timeoutAfterDeliveryRate = 0.1;
+});
+afterAll(async () => {
+  await workers.stop();
+  await purgeAll();
+  await closePublisher();
+  await wipeBatches();
+  await prisma.$disconnect();
+});
 
-  // MOMENT 1: Atomic Spreadsheet Upload with Row-by-Row Error Reporting
-  describe("Moment 1: Atomic Spreadsheet Validation", () => {
-    it("detects exact bad rows and guarantees all-or-nothing atomicity", () => {
-      const mockSpreadsheetData = [
-        { fullName: "Aarav Sharma", phone: "9876543210", nationalId: "AADHAAR1001", score: 88 },
-        { fullName: "B", phone: "invalid_phone", nationalId: "AADHAAR1002", score: 92 }, // Bad name & phone
-        { fullName: "Chirag Verma", phone: "9876543212", nationalId: "AADHAAR1003", score: 120 }, // Bad score (>100)
-        { fullName: "Deepa Nair", phone: "9876543213", nationalId: "AADHAAR1001", score: 75 }, // Duplicate nationalId
-      ];
+describe("Moment 1: bad spreadsheet rows, nothing half-saved", () => {
+  it("reports every bad row and saves no candidates", async () => {
+    const created = await as("anika", "post", "/api/batches").send({ courseName: "Welding Level 2" });
+    const id = created.body.id as string;
+    const rows = goodRows(5);
+    rows[1] = { ...rows[1]!, phone: "123" }; // sheet row 3
+    rows[2] = { ...rows[2]!, fullName: "" }; // sheet row 4
+    rows[4] = { ...rows[4]!, score: 150 }; // sheet row 6
 
-      const errors: Array<{ row: number; field: string; message: string }> = [];
-      const seenNationalIds = new Set<string>();
+    const res = await as("anika", "post", `/api/batches/${id}/upload`).attach("file", sheet(rows), "c.xlsx");
 
-      mockSpreadsheetData.forEach((row, index) => {
-        const rowNumber = index + 2;
-        const res = CandidateRowSchema.safeParse(row);
-
-        if (!res.success) {
-          res.error.issues.forEach((issue) => {
-            errors.push({
-              row: rowNumber,
-              field: issue.path.join("."),
-              message: issue.message,
-            });
-          });
-        } else {
-          if (seenNationalIds.has(row.nationalId)) {
-            errors.push({
-              row: rowNumber,
-              field: "nationalId",
-              message: `Duplicate National ID '${row.nationalId}' found in spreadsheet`,
-            });
-          } else {
-            seenNationalIds.add(row.nationalId);
-          }
-        }
-      });
-
-      // Assert that errors were caught with exact row numbers and fields
-      expect(errors.length).toBeGreaterThan(0);
-      expect(errors.some((e) => e.row === 3 && e.field === "fullName")).toBe(true);
-      expect(errors.some((e) => e.row === 3 && e.field === "phone")).toBe(true);
-      expect(errors.some((e) => e.row === 4 && e.field === "score")).toBe(true);
-
-      // Atomic assertion: If errorCount > 0, zero records are committed to DB
-      const committedRecords = errors.length > 0 ? 0 : mockSpreadsheetData.length;
-      expect(committedRecords).toBe(0);
-    });
-  });
-
-  // MOMENT 2: Concurrent Multi-Officer Approval Logic
-  describe("Moment 2: Concurrent Multi-Officer Approvals", () => {
-    it("requires at least 2 distinct officers to advance a batch", () => {
-      const reviewCycle = 1;
-      const votes: Array<{ officerId: string; decision: string; cycle: number }> = [];
-
-      function castApproval(officerId: string) {
-        // Enforce unique vote per officer per cycle
-        if (votes.some((v) => v.officerId === officerId && v.cycle === reviewCycle)) {
-          throw new Error("Officer already voted in this review cycle");
-        }
-        votes.push({ officerId, decision: "APPROVED", cycle: reviewCycle });
-
-        const approvalCount = votes.filter((v) => v.decision === "APPROVED" && v.cycle === reviewCycle).length;
-        return approvalCount >= 2 ? "STATE_PENDING" : "DISTRICT_PENDING";
-      }
-
-      // Officer 1 (Dev) approves -> Still DISTRICT_PENDING
-      const stateAfterDev = castApproval("dev-officer-id");
-      expect(stateAfterDev).toBe("DISTRICT_PENDING");
-      expect(votes.length).toBe(1);
-
-      // Dev tries to approve again -> Rejected by composite uniqueness
-      expect(() => castApproval("dev-officer-id")).toThrow();
-
-      // Officer 2 (Meera) approves -> Moves to STATE_PENDING
-      const stateAfterMeera = castApproval("meera-officer-id");
-      expect(stateAfterMeera).toBe("STATE_PENDING");
-      expect(votes.length).toBe(2);
-
-      // Officer 3 (Kabir) approves after consensus -> State remains advanced once, not twice
-      const stateAfterKabir = castApproval("kabir-officer-id");
-      expect(stateAfterKabir).toBe("STATE_PENDING");
-      expect(votes.length).toBe(3);
-    });
-  });
-
-  // MOMENT 3: 60-Candidate WhatsApp Delivery with Flaky Network
-  describe("Moment 3: Resilient 60-Candidate WhatsApp Issuance", () => {
-    it("delivers exactly 1 certificate per candidate even with 35% network failure rate", async () => {
-      StandinWhatsAppProvider.failureRate = 0.35; // 35% simulated failure / timeout rate
-      const candidateCount = 60;
-      const candidates = Array.from({ length: candidateCount }, (_, i) => ({
-        id: `cand_${i + 1}`,
-        fullName: `Candidate ${i + 1}`,
-        phone: `+9198765${String(i).padStart(5, "0")}`,
-        course: "Electrician Level 3",
-        certNumber: `CERT-2026-${String(i + 1).padStart(4, "0")}`,
-      }));
-
-      // Issue and send concurrently for all 60 candidates
-      const deliveryPromises = candidates.map(async (c) => {
-        const idempotencyKey = `wa_delivery_${c.id}_${c.certNumber}`;
-        return StandinWhatsAppProvider.sendMessage({
-          to: c.phone,
-          templateName: "skilling_certificate_issued",
-          parameters: {
-            candidateName: c.fullName,
-            courseName: c.course,
-            certificateNumber: c.certNumber,
-            downloadUrl: `http://localhost:8081/certificates/${c.certNumber}.pdf`,
-          },
-          idempotencyKey,
-        });
-      });
-
-      const results = await Promise.all(deliveryPromises);
-
-      // Verify all 60 candidates received certificates
-      expect(results.length).toBe(60);
-      results.forEach((res) => {
-        expect(res.success).toBe(true);
-      });
-
-      // Verify strict idempotency: exactly 60 distinct keys delivered
-      const deliveredKeys = StandinWhatsAppProvider.getDeliveredKeys();
-      expect(deliveredKeys.size).toBe(60);
-
-      // Retrying a delivery for an already-sent key returns identical messageId without resending
-      const candidate1Key = `wa_delivery_${candidates[0]!.id}_${candidates[0]!.certNumber}`;
-      const duplicateAttempt = await StandinWhatsAppProvider.sendMessage({
-        to: candidates[0]!.phone,
-        templateName: "skilling_certificate_issued",
-        parameters: {
-          candidateName: candidates[0]!.fullName,
-          courseName: candidates[0]!.course,
-          certificateNumber: candidates[0]!.certNumber,
-          downloadUrl: `http://localhost:8081/certificates/${candidates[0]!.certNumber}.pdf`,
-        },
-        idempotencyKey: candidate1Key,
-      });
-
-      expect(duplicateAttempt.messageId).toBe(deliveredKeys.get(candidate1Key)!.messageId);
-      expect(deliveredKeys.size).toBe(60); // Still exactly 60!
-    });
-  });
-
-  // MOMENT 4: Instant Public Revocation Check
-  describe("Moment 4: State Office Revocation & Privacy Masking", () => {
-    it("masks candidate name to prevent identity leakage during public verification", () => {
-      const masked1 = CertificateService.maskName("Rahul Kumar");
-      expect(masked1).toBe("R***l K***r");
-
-      const masked2 = CertificateService.maskName("Anika");
-      expect(masked2).toBe("A***a");
-    });
-
-    it("immediately invalidates validity upon revocation", () => {
-      let certificate = {
-        number: "CERT-2026-A1B2C3",
-        status: "VALID",
-        revokedAt: null as Date | null,
-        revocationReason: null as string | null,
-      };
-
-      // Employer verification before revocation
-      expect(certificate.status).toBe("VALID");
-
-      // State Office cancels certificate
-      certificate = {
-        ...certificate,
-        status: "REVOKED",
-        revokedAt: new Date(),
-        revocationReason: "Forged marksheet detected",
-      };
-
-      // Employer checking 1 minute later
-      expect(certificate.status).toBe("REVOKED");
-      expect(certificate.revocationReason).toBe("Forged marksheet detected");
-    });
-  });
-
-  // MOMENT 5: SLA Breach Detection
-  describe("Moment 5: Automated SLA Breach Detection", () => {
-    it("flags batches that have exceeded their SLA deadline", () => {
-      const now = new Date();
-      const batches = [
-        { id: "batch_1", status: "DISTRICT_PENDING", slaDeadline: new Date(now.getTime() - 3600 * 1000) }, // Overdue by 1 hr
-        { id: "batch_2", status: "DISTRICT_PENDING", slaDeadline: new Date(now.getTime() + 86400 * 1000) }, // Within SLA
-        { id: "batch_3", status: "QUALITY_PENDING", slaDeadline: new Date(now.getTime() - 7200 * 1000) }, // Overdue by 2 hrs
-      ];
-
-      const breached = batches.filter((b) => b.slaDeadline < now);
-      expect(breached.length).toBe(2);
-      expect(breached.map((b) => b.id)).toEqual(["batch_1", "batch_3"]);
-    });
-  });
-
-  // MOMENT 6: Documented Resubmission Lifecycle
-  describe("Moment 6: Send-back and Resubmission Behavior", () => {
-    it("archives previous approvals and requires fresh consensus on resubmission", () => {
-      let batch = {
-        status: "SENT_BACK",
-        reviewCycle: 1,
-        approvals: [
-          { officerId: "dev", cycle: 1, decision: "APPROVED" },
-          { officerId: "meera", cycle: 1, decision: "SENT_BACK" },
-        ],
-      };
-
-      // Centre resubmits batch after fixing
-      const newCycle = batch.reviewCycle + 1;
-      batch = {
-        ...batch,
-        status: "DISTRICT_PENDING",
-        reviewCycle: newCycle,
-      };
-
-      expect(batch.reviewCycle).toBe(2);
-      expect(batch.status).toBe("DISTRICT_PENDING");
-
-      // Active approvals for cycle 2 should be 0, requiring fresh consensus
-      const activeApprovals = batch.approvals.filter((a) => a.cycle === batch.reviewCycle);
-      expect(activeApprovals.length).toBe(0);
-    });
-  });
-
-  // SECURITY: Cryptographic tamper-proofing
-  describe("Security: SHA-256 Tamper Evident Hash", () => {
-    it("generates deterministic fingerprint that changes if data is altered", () => {
-      const issueDate = new Date("2026-11-21T00:00:00.000Z");
-      const original = {
-        candidateId: "cand_1",
-        candidateName: "Pooja Reddy",
-        nationalId: "AADHAAR-8899",
-        courseName: "Solar Panel Technician",
-        score: 95.0,
-        grade: "A",
-        batchId: "batch_101",
-        issuedAt: issueDate,
-      };
-
-      const hash1 = generateVerificationHash(original);
-      const hash2 = generateVerificationHash(original);
-      expect(hash1).toBe(hash2); // Deterministic
-
-      // If someone tampers with the score from 95 to 99:
-      const tampered = { ...original, score: 99.0 };
-      const tamperedHash = generateVerificationHash(tampered);
-      expect(tamperedHash).not.toBe(hash1); // Tampering detected!
-    });
+    expect(res.status).toBe(422);
+    const badRows = new Set(res.body.errors.map((e: { row: number }) => e.row));
+    expect(badRows).toEqual(new Set([3, 4, 6]));
+    expect(await prisma.candidate.count({ where: { batchId: id } })).toBe(0);
+    expect((await prisma.batch.findUnique({ where: { id } }))!.totalCandidates).toBe(0);
   });
 });
 
+describe("Moment 2: concurrent officer approvals advance the batch once", () => {
+  it("never advances twice, records one vote per officer, and converges after retries", async () => {
+    const id = await submittedBatch(5);
+
+    const results = await Promise.all(
+      (["dev", "meera", "kabir"] as const).map((p) => review(p, id, "district", "APPROVED"))
+    );
+    // Whoever lost the race is told to retry (409), never a 500 or a silent drop.
+    for (const [i, p] of (["dev", "meera", "kabir"] as const).entries()) {
+      if (results[i]!.status !== 200) {
+        expect(results[i]!.status).toBe(409);
+        const batch = await prisma.batch.findUnique({ where: { id } });
+        if (batch!.status === "DISTRICT_PENDING") await review(p, id, "district", "APPROVED");
+      }
+    }
+
+    const batch = await prisma.batch.findUnique({ where: { id } });
+    expect(batch!.status).toBe("STATE_PENDING");
+    const votes = await prisma.batchApproval.findMany({ where: { batchId: id } });
+    expect(new Set(votes.map((v) => v.officerId)).size).toBe(votes.length); // one vote per officer
+    const advanced = (await prisma.auditLog.findMany({ where: { batchId: id, action: "DISTRICT_APPROVED" } })).filter(
+      (a) => (a.details as { advanced?: boolean }).advanced
+    );
+    expect(advanced).toHaveLength(1);
+  });
+
+  it("needs two distinct officers: one approval is not enough", async () => {
+    const id = await submittedBatch(3);
+    await review("dev", id, "district", "APPROVED");
+    expect((await prisma.batch.findUnique({ where: { id } }))!.status).toBe("DISTRICT_PENDING");
+    const again = await review("dev", id, "district", "APPROVED"); // same officer cannot vote twice
+    expect(again.status).toBeGreaterThanOrEqual(400);
+    expect((await prisma.batch.findUnique({ where: { id } }))!.status).toBe("DISTRICT_PENDING");
+  });
+});
+
+describe("Moment 3: 60 candidates, flaky WhatsApp, exactly one certificate and message each", () => {
+  it("approval alone triggers issuance; a worker restart midway loses nothing and duplicates nothing", async () => {
+    const id = await approvedBatch(60); // >50 => district x2, quality, state. No manual issue call.
+
+    await waitFor(async () => (await prisma.deliveryJob.count({ where: { status: "COMPLETED" } })) >= 15, 40_000, "some deliveries");
+    await workers.stop(); // crash the workers mid-run (unacked messages go back to the queue)
+    workers = await startWorkers();
+    await waitDelivered(id, 60);
+
+    const certs = await prisma.certificate.findMany({ where: { batchId: id } });
+    expect(certs).toHaveLength(60);
+    expect(new Set(certs.map((c) => c.certificateNumber)).size).toBe(60);
+    expect(new Set(certs.map((c) => c.candidateId)).size).toBe(60);
+    expect(certs.every((c) => c.pdfUrl)).toBe(true);
+    const jobs = await prisma.deliveryJob.findMany();
+    expect(jobs).toHaveLength(60);
+    expect(jobs.every((j) => j.status === "COMPLETED")).toBe(true);
+    // Every message reached the "phone" exactly once, despite failures, timeouts-after-delivery and the restart.
+    const sends = StandinWhatsAppProvider.getSendCounts();
+    expect(sends.size).toBe(60);
+    expect([...sends.values()].every((n) => n === 1)).toBe(true);
+  });
+
+  it("recovers when the enqueue message is lost (sweeper)", async () => {
+    const id = await approvedBatch(3);
+    await purgeAll(); // simulate the broker losing the batch.issue message
+    await waitDelivered(id, 3);
+    expect(await prisma.certificate.count({ where: { batchId: id } })).toBe(3);
+  });
+
+  it("dead-letters an exhausted delivery, marks it FAILED, and an operator re-trigger re-drives it", async () => {
+    process.env.QUEUE_MAX_ATTEMPTS = "2";
+    StandinWhatsAppProvider.failureRate = 1;
+    try {
+      const id = await approvedBatch(2);
+      await waitFor(async () => (await prisma.deliveryJob.count({ where: { status: "FAILED" } })) === 2, 30_000, "FAILED jobs");
+      expect(await deadLetterCount(Q.deliver)).toBe(2);
+
+      StandinWhatsAppProvider.failureRate = 0;
+      process.env.QUEUE_MAX_ATTEMPTS = "12";
+      const re = await as("farah", "post", `/api/certificates/batch/${id}/issue`).send();
+      expect(re.status).toBe(202);
+      await waitDelivered(id, 2);
+    } finally {
+      process.env.QUEUE_MAX_ATTEMPTS = "12";
+    }
+  });
+
+  it("refuses to issue for a batch that is not approved", async () => {
+    const id = await submittedBatch(3);
+    const res = await as("farah", "post", `/api/certificates/batch/${id}/issue`).send();
+    expect(res.status).toBe(409);
+    expect(await prisma.certificate.count()).toBe(0);
+  });
+});
+
+describe("Moment 4: cancel a certificate, verification reflects it immediately", () => {
+  async function issueOne() {
+    StandinWhatsAppProvider.failureRate = 0;
+    const id = await approvedBatch(3);
+    await waitDelivered(id, 3);
+    return (await prisma.certificate.findFirstOrThrow({ where: { batchId: id }, include: { candidate: true } }));
+  }
+
+  it("verifies valid, masks the name, then reports revoked at once", async () => {
+    const cert = await issueOne();
+
+    const ok = await request(app).get(`/api/verify/${cert.certificateNumber}`);
+    expect(ok.status).toBe(200);
+    expect(ok.body.valid).toBe(true);
+    expect(ok.body.candidateName).not.toContain(cert.candidate.fullName.split(" ")[0]);
+    expect(ok.body).not.toHaveProperty("pdfUrl");
+    expect(ok.body).not.toHaveProperty("verificationHash");
+    expect(ok.body).not.toHaveProperty("score");
+
+    const rev = await as("farah", "post", `/api/certificates/${cert.id}/revoke`).send({ reason: "Forged marksheet" });
+    expect(rev.status).toBe(200);
+
+    const after = await request(app).get(`/api/verify/${cert.certificateNumber}`);
+    expect(after.body.valid).toBe(false);
+    expect(after.body.status).toBe("REVOKED");
+    expect(await prisma.auditLog.count({ where: { entityId: cert.id, action: "CERTIFICATE_REVOKED" } })).toBe(1);
+
+    const again = await as("farah", "post", `/api/certificates/${cert.id}/revoke`).send({ reason: "again" });
+    expect(again.status).toBe(409);
+  });
+
+  it("only the state office can revoke", async () => {
+    const cert = await issueOne();
+    for (const p of ["anika", "dev", "neha"] as const) {
+      const res = await as(p, "post", `/api/certificates/${cert.id}/revoke`).send({ reason: "x" });
+      expect(res.status).toBe(403);
+    }
+    expect((await request(app).get(`/api/verify/${cert.certificateNumber}`)).body.valid).toBe(true);
+  });
+
+  it("serves the PDF only through a valid signed link, and not after cancellation", async () => {
+    const cert = await issueOne();
+    const good = signDownloadToken(cert.id);
+
+    const ok = await request(app).get(`/api/certificates/${cert.id}/download?token=${good}`);
+    expect(ok.status).toBe(200);
+    expect(ok.headers["content-type"]).toContain("pdf");
+
+    expect((await request(app).get(`/api/certificates/${cert.id}/download`)).status).toBe(403);
+    expect((await request(app).get(`/api/certificates/${cert.id}/download?token=${good}x`)).status).toBe(403);
+    expect((await request(app).get(`/api/certificates/${cert.id}/download?token=1.${"0".repeat(64)}`)).status).toBe(403);
+    const other = signDownloadToken("some-other-certificate-id");
+    expect((await request(app).get(`/api/certificates/${cert.id}/download?token=${other}`)).status).toBe(403);
+    // The old public static route is gone.
+    expect((await request(app).get(`/certificates/${cert.certificateNumber}.pdf`)).status).toBe(404);
+
+    await as("farah", "post", `/api/certificates/${cert.id}/revoke`).send({ reason: "fake" });
+    expect((await request(app).get(`/api/certificates/${cert.id}/download?token=${good}`)).status).toBe(410);
+  });
+
+  it("shows delivery status on the batch and gives staff a working download link", async () => {
+    const cert = await issueOne();
+    const detail = await as("farah", "get", `/api/batches/${cert.batchId}`).send();
+    const c = detail.body.certificates.find((x: { id: string }) => x.id === cert.id);
+    expect(c.deliveryJobs[0].status).toBe("COMPLETED");
+    expect(JSON.stringify(detail.body.certificates)).not.toMatch(/verificationHash|pdfUrl/);
+
+    for (const who of ["farah", "anika"] as const) {
+      const link = await as(who, "post", `/api/certificates/${cert.id}/download-link`).send();
+      expect(link.status).toBe(200);
+      const file = await request(app).get(link.body.url);
+      expect(file.status).toBe(200);
+      expect(file.headers["content-type"]).toContain("pdf");
+    }
+    expect((await as("dev", "post", `/api/certificates/${cert.id}/download-link`).send()).status).toBe(403);
+    expect((await request(app).post(`/api/certificates/${cert.id}/download-link`).send()).status).toBe(401);
+  });
+
+  it("returns 404 for an unknown certificate", async () => {
+    const res = await request(app).get("/api/verify/CERT-2026-DOESNOTEXIST");
+    expect(res.status).toBe(404);
+    expect(res.body.valid).toBe(false);
+  });
+});
+
+describe("Moment 5: a batch stuck past its SLA is escalated without chasing", () => {
+  it("escalates once per step even if scanned repeatedly or concurrently; /stuck is read-only", async () => {
+    const id = await submittedBatch(3);
+    await prisma.batch.update({ where: { id }, data: { slaDeadline: new Date(Date.now() - 3 * 3600 * 1000) } });
+
+    const stuck = await as("farah", "get", "/api/batches/stuck").send();
+    expect(stuck.body.map((b: { batchId: string }) => b.batchId)).toContain(id);
+    expect(await prisma.auditLog.count({ where: { batchId: id, action: "SLA_BREACH_ESCALATED" } })).toBe(0);
+
+    await Promise.all([SlaMonitorWorker.scanAndEscalateBreaches(), SlaMonitorWorker.scanAndEscalateBreaches()]);
+    await SlaMonitorWorker.scanAndEscalateBreaches();
+    expect(await prisma.auditLog.count({ where: { batchId: id, action: "SLA_BREACH_ESCALATED" } })).toBe(1);
+  });
+
+  it("gives each approval step its own clock and re-arms escalation", async () => {
+    const id = await submittedBatch(3);
+    await prisma.batch.update({ where: { id }, data: { slaDeadline: new Date(Date.now() - 3600 * 1000) } });
+    await SlaMonitorWorker.scanAndEscalateBreaches();
+
+    await review("dev", id, "district", "APPROVED");
+    await review("meera", id, "district", "APPROVED"); // -> STATE_PENDING: new step, new clock
+    const b = await prisma.batch.findUniqueOrThrow({ where: { id } });
+    expect(b.status).toBe("STATE_PENDING");
+    expect(b.slaDeadline!.getTime()).toBeGreaterThan(Date.now());
+    expect(b.escalatedAt).toBeNull();
+  });
+});
+
+describe("Moment 6: send back, resubmit, earlier approvals no longer count", () => {
+  it("requires two fresh district approvals in the new review cycle", async () => {
+    const id = await submittedBatch(3);
+    await review("dev", id, "district", "APPROVED"); // cycle 1 vote
+    await review("meera", id, "district", "SENT_BACK", "fix phone numbers");
+    expect((await prisma.batch.findUnique({ where: { id } }))!.status).toBe("SENT_BACK");
+
+    const re = await as("anika", "post", `/api/batches/${id}/resubmit`).send();
+    expect(re.status).toBe(200);
+    expect((await prisma.batch.findUnique({ where: { id } }))!.reviewCycle).toBe(2);
+
+    await review("dev", id, "district", "APPROVED"); // Dev's cycle-1 approval must not count
+    expect((await prisma.batch.findUnique({ where: { id } }))!.status).toBe("DISTRICT_PENDING");
+    await review("kabir", id, "district", "APPROVED");
+    expect((await prisma.batch.findUnique({ where: { id } }))!.status).toBe("STATE_PENDING");
+    // History is kept.
+    expect(await prisma.batchApproval.count({ where: { batchId: id, reviewCycle: 1 } })).toBe(2);
+  });
+});

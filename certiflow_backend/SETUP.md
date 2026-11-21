@@ -1,100 +1,72 @@
-# CertiFlow: Fresh Clone Local Setup Guide
+# CertiFlow: Local Setup
 
-This guide enables any evaluator or teammate to go from a fresh clone to a running system with seeded demo data and passing automated tests in under 2 minutes.
+Needs Node 20+, npm 10+, and Docker.
 
----
+## Fastest path: everything in containers
 
-## Prerequisites
-
-* **Node.js**: v20 or higher
-* **npm**: v10 or higher
-* *(Optional)* **Docker & Docker Compose** (for running local PostgreSQL & Redis)
-
----
-
-## 1. Quick Start (Using Configured Cloud Supabase)
-
-The repository is pre-configured to connect directly to the live Supabase PostgreSQL database.
-
-### Step 1: Install Dependencies
 ```bash
-npm install
+cp .env.example .env     # JWT_SECRET is optional for this local demo (a demo default is used); set a real one anywhere else
+docker compose up --build
 ```
 
-### Step 2: Configure Environment
-Copy `.env.example` to `.env` (already pre-filled with credentials):
+This starts Postgres, Redis, RabbitMQ (management UI at http://localhost:15672, login guest / guest), runs migrations and seeds the demo data, then starts the API (`http://localhost:8081`) and a worker. Scale workers with `docker compose up --scale worker=3`.
+
+The steps below are for running the API from source.
+
+## 1. Install and configure
+
 ```bash
+npm install
 cp .env.example .env
 ```
 
-### Step 3: Run Database Migrations & Seed Demo Data
+Edit `.env`: set `JWT_SECRET` (required; `openssl rand -hex 32`). The defaults point at the local Docker Postgres and Redis below. Never commit `.env`.
+
+## 2. Start Postgres and Redis
+
 ```bash
-npx prisma db push
+docker compose up -d postgres redis rabbitmq
+```
+
+## 3. Migrate and seed demo data
+
+```bash
+npx prisma migrate deploy
 npm run seed
 ```
 
-This seeds the 6 required demo personas:
-| Persona | Role | Email | Password |
-| :--- | :--- | :--- | :--- |
-| **Anika Sharma** | Training Centre | `anika@skills.pragati.gov.in` | `Password123!` |
-| **Dev Patel** | District Officer 1 | `dev@district.pragati.gov.in` | `Password123!` |
-| **Meera Nair** | District Officer 2 | `meera@district.pragati.gov.in` | `Password123!` |
-| **Kabir Khan** | District Officer 3 | `kabir@district.pragati.gov.in` | `Password123!` |
-| **Neha Gupta** | Quality Team | `neha@quality.pragati.gov.in` | `Password123!` |
-| **Farah Sheikh** | State Office | `farah@state.pragati.gov.in` | `Password123!` |
+Seeded personas (password `Password123!`): Anika (centre), Dev, Meera, Kabir (district officers), Neha (quality), Farah (state office). Emails are in `prisma/seed.ts`.
 
-### Step 4: Run Automated Tests
-Execute the test suite proving all 6 mandatory hackathon moments:
+## 4. Run the API
+
 ```bash
+npm run dev          # API on http://localhost:8081, health: GET /health
+npm run dev:worker   # in a second terminal: queue consumers, sweeper, SLA scan
+```
+
+API docs and a try-it-out console: http://localhost:8081/api/docs
+
+Reviewers can switch persona without a password while `DEMO_MODE=true`:
+
+```bash
+curl -X POST http://localhost:8081/api/auth/demo-login -H "Content-Type: application/json" -d '{"persona":"farah"}'
+```
+
+Set `DEMO_MODE=false` anywhere that is not a demo.
+
+## 5. Run the tests
+
+Tests use their own throwaway Postgres and Redis (never your `.env` database; the runner refuses non-local databases):
+
+```bash
+docker run -d --name certiflow_test_pg -e POSTGRES_PASSWORD=test -e POSTGRES_DB=certiflow_test -p 55432:5432 postgres:16-alpine
+docker run -d --name certiflow_test_redis -p 56379:6379 redis:7-alpine
+docker run -d --name certiflow_test_rabbit -p 56672:5672 rabbitmq:3-alpine
 npm test
 ```
 
-### Step 5: Start the Development Server
-```bash
-npm run dev
-```
+Override with `TEST_DATABASE_URL` / `TEST_REDIS_URL` / `TEST_RABBITMQ_URL` if you use other ports. The test run applies migrations and seeds by itself.
 
-The server will be available at:
-* **API Root**: `http://localhost:8081/`
-* **Healthcheck**: `http://localhost:8081/`
-* **Public Verification**: `http://localhost:8081/api/verify/:certificateNumber`
+## Notes
 
----
-
-## 2. Alternative: Single-Command Local Setup (Docker)
-
-If you prefer to run completely locally without Supabase:
-
-```bash
-docker compose up -d
-```
-
-This starts:
-* PostgreSQL on port `5432`
-* Redis on port `6379`
-* CertiFlow Backend API on port `8081`
-
----
-
-## 3. Fast Persona Login for Reviewers
-
-Reviewers can switch accounts instantly using the demo login endpoint without manual password entry:
-
-```bash
-# Login as Anika (Training Centre)
-curl -X POST http://localhost:8081/api/auth/demo-login \
-  -H "Content-Type: application/json" \
-  -d '{"persona": "anika"}'
-
-# Login as Dev (District Officer)
-curl -X POST http://localhost:8081/api/auth/demo-login \
-  -H "Content-Type: application/json" \
-  -d '{"persona": "dev"}'
-
-# Login as Farah (State Office)
-curl -X POST http://localhost:8081/api/auth/demo-login \
-  -H "Content-Type: application/json" \
-  -d '{"persona": "farah"}'
-```
-
-Returns the JWT bearer token and user role profile.
+* Typecheck: `npm run typecheck`. Build: `npm run build`.
